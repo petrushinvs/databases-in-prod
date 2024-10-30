@@ -1,0 +1,36 @@
+# Values file for PSMDB operator. https://docs.percona.com/percona-operator-for-mongodb/helm.html
+image:
+  repository: ghcr.io/sergelogvinov/percona-server-mongodb-operator
+  tag: 1.16.2
+
+watchAllNamespaces: true
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 2
+  runAsGroup: 2
+  fsGroup: 2
+  fsGroupChangePolicy: "OnRootMismatch"
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - ALL
+  seccompProfile:
+    type: RuntimeDefault
+
+resources:
+  limits:
+    cpu: 100m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 64Mi
+
+nodeSelector:
+  node-role.kubernetes.io/control-plane: ""
+
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    effect: NoSchedule

@@ -1,0 +1,187 @@
+# Production-ready Values for the Percona Server for MongoDB operator to build the ReplicaSet with backup and monitoring.
+# commands:
+# helm repo add percona https://percona.github.io/percona-helm-charts/
+# helm repo update
+# helm --namespace production-db upgrade --install mongo-prod percona/psmdb-db -f psmdb-rs-example.yaml
+
+fullnameOverride: mongo-prod
+
+# Very important to set, otherwise the operator will not be able to create the resources
+clusterServiceDNSSuffix: svc.cluster.local
+
+finalizers:
+  - delete-psmdb-pods-in-order
+
+image:
+  repository: percona/percona-server-mongodb
+  tag: 7.0-multi
+imagePullPolicy: IfNotPresent
+
+# disable the unsafe configurations: https://docs.percona.com/percona-operator-for-mongodb/operator.html?h=unsafe#allowunsafeconfigurations
+allowUnsafeConfigurations: false
+
+# The update strategy for the operator, scheduled to quiet hours
+updateStrategy: SmartUpdate
+upgradeOptions:
+  apply: 7.0-recommended
+  schedule: "0 4 * 2-4 *"
+
+initContainerSecurityContext:
+  allowPrivilegeEscalation: false
+  seccompProfile:
+    type: RuntimeDefault
+  capabilities:
+    drop:
+    - ALL
+  runAsNonRoot: true
+
+replsets:
+  rs0:
+    name: rs0
+    # safe sizes start from 3, but you can increase it to 5 or 7
+    size: 3
+    # anti-affinity to spread the pods across the nodes in the cluster
+    antiAffinityTopologyKey: "kubernetes.io/hostname"
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      seccompProfile:
+        type: RuntimeDefault
+      capabilities:
+        drop:
+        - ALL
+      runAsNonRoot: true
+      runAsUser: 1001
+    # priority class to give the pods a higher priority
+    priorityClass: production-db
+    # for production use ALWAYS set the resources for the pods
+    # this is enough and comfortable for medium workloads with minimum latency
+    # numbers be like 1000-2000 requests per second, incl. aggregation queries, up to 1TB of data, up to 2 billion documents
+    resources:
+      limits:
+        cpu: 6
+        memory: 6Gi
+      # we want to guarantee enough CPU to run with numbers above and enogh memory w/o OOM
+      requests:
+        cpu: 2500m
+        memory: 6Gi
+    livenessProbe:
+      failureThreshold: 60
+    # node selector to spread the pods across the right nodes in the cluster
+    nodeSelector:
+      project.io/node-pool: db
+    # volume spec for the pod
+    volumeSpec:
+      pvc:
+        # storage class for the PVC, make sure it exists in the cluster, ssd backed, have enogh IOPS and throughput
+        # even for the production use, you don't need the mirroring and/or any kind of RAID, the mongodb will take care of the data
+        storageClassName: ssd
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 500Gi
+    # annotations for the pods: we want our prometheus to scrape the metrics, metrics must be available on all pods
+    annotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "9216"
+      prometheus.io/path: "/metrics"
+    # monitoring sidecar for the pod
+    sidecars:
+    - image: percona/mongodb_exporter:0.40
+      env:
+      - name: EXPORTER_USER
+        valueFrom:
+          secretKeyRef:
+            name: internal-mongo-prod-users
+            key: MONGODB_CLUSTER_MONITOR_USER
+      - name: EXPORTER_PASS
+        valueFrom:
+          secretKeyRef:
+            name: internal-mongo-prod-users
+            key: MONGODB_CLUSTER_MONITOR_PASSWORD
+      - name: POD_NAME
+        valueFrom:
+          fieldRef:
+            apiVersion: v1
+            fieldPath: metadata.name
+      - name: MONGODB_URI
+        value: "mongodb://$(EXPORTER_USER):$(EXPORTER_PASS)@$(POD_NAME)"
+      args: ["--discovering-mode", "--compatible-mode", "--collect-all", "--log.level=warn", "--mongodb.uri=$(MONGODB_URI)"]
+      name: metrics
+      ports:
+      - name: http-metrics
+        containerPort: 9216
+        protocol: TCP
+      containerSecurityContext:
+        allowPrivilegeEscalation: false
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop:
+          - ALL
+        runAsNonRoot: true
+      resources:
+        limits:
+          cpu: 200m
+          memory: 200Mi
+        requests:
+          cpu: 10m
+          memory: 100Mi
+    # for clarity we don't want the non-voting and arbiter nodes
+    nonvoting:
+      enabled: false
+    arbiter:
+      enabled: false
+
+# for clarity we don't want the sharding
+# as of my experience, the sharding takes more resources and time to manage
+# resources/latency trade-off justifies itself when you have more than 1TB of data, more than 2 billion documents,
+# and good sharding key(s) to distribute the data across the shards
+sharding:
+  enabled: false
+
+# the backup configuration
+backup:
+  enabled: true
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    seccompProfile:
+      type: RuntimeDefault
+    capabilities:
+      drop:
+      - ALL
+    runAsNonRoot: true
+    runAsUser: 1001
+# the backup resources: it could take significant resources, so make sure you have enough
+  resources:
+    limits:
+      cpu: 3000m
+      memory: 3G
+    requests:
+      cpu: 100m
+      memory: 600Mi
+# point-in-time recovery may not work for all cases
+  pitr:
+    enabled: false
+  storages:
+    myazure:
+      type: azure
+      azure:
+        container: backup
+        prefix: mongo-prod
+        credentialsSecret: backup-azure
+    mys3:
+      type: s3
+      s3:
+        bucket: 200ok-s3-backups
+        endpointUrl: https://s3.eu-central-1.amazonaws.com
+        region: eu-central-1
+        prefix: mongo-prod
+        credentialsSecret: backup-s3
+  tasks:
+    - name: "daily-backup"
+      enabled: true
+      schedule: "15 9 * * 4"
+      keep: 7
+      type: logical
+      storageName: s3
+      compressionType: gzip

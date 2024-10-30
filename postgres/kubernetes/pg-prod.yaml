@@ -1,0 +1,339 @@
+---
+# PostgreSQL production database manifest for Zalando Postgres Operator
+kind: "postgresql"
+apiVersion: "acid.zalan.do/v1"
+metadata:
+  name: "pg-prod"
+  namespace: "production-db"
+  labels:
+    team: production
+spec:
+  teamId: "production"
+  postgresql:
+    version: "16"
+    parameters:
+      # set the default autovacuum parameters
+      autovacuum_analyze_scale_factor: "0.1"
+      autovacuum_vacuum_scale_factor: "0.2"
+      # setup logs for future debugging of the most aspects of the database
+      log_destination: "stderr"
+      log_connections: "off"
+      log_disconnections: "off"
+      log_min_duration_statement: "100ms"
+      log_statement: "ddl"
+      log_lock_waits: "on"
+      log_temp_files: "0"
+      # limit the connections
+      max_connections: "150"
+      superuser_reserved_connections: "5"
+      # set the maximum delay for the standby
+      # after this timeout all queries on replica will be canceled until the standby will be up to date
+      max_standby_archive_delay: "900s"
+      max_standby_streaming_delay: "900s"
+
+      wal_level: "replica"
+      max_wal_senders: "6"
+      max_replication_slots: "6"
+      max_worker_processes: "16"
+      max_parallel_workers: "4"
+      max_parallel_workers_per_gather: "4"
+      max_parallel_maintenance_workers: "2"
+      max_wal_size: "4GB"
+      min_wal_size: "2GB"
+      wal_keep_size: "2GB"
+      effective_cache_size: "4GB"
+      # we're on ssd
+      effective_io_concurrency: "100"
+      random_page_cost: "1.1"
+      # enable the extentions, pg_stat_statements is a must-have for production
+      shared_preload_libraries: "pg_stat_statements,pg_cron,pg_trgm,pgcrypto,pg_stat_kcache"
+      track_io_timing: "on"
+      pg_stat_statements.max: "1000"
+      pg_stat_statements.track: "all"
+      cron.database_name: "postgres"
+
+      synchronous_commit: "local"
+      shared_buffers: "2GB"
+      work_mem: "64MB"
+      maintenance_work_mem: "256MB"
+
+  numberOfInstances: 2
+  enableShmVolume: true
+  podAnnotations:
+    cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    prometheus.io/port: "9187"
+    prometheus.io/scrape: "true"
+    prometheus.io/path: "/metrics"
+  # always use pgbouncer for the production databases to avoid the connection storms
+  enableConnectionPooler: true
+  enableReplicaConnectionPooler: true
+
+  connectionPooler:
+    numberOfInstances: 2
+    mode: "transaction"
+    resources:
+      requests:
+        cpu: 200m
+        memory: 100Mi
+      limits:
+        cpu: 500m
+        memory: 200Mi
+    maxDBConnections: 70
+    # max client connections per pooler is always 10 000!!!
+
+  volume:
+    size: "60Gi"
+    storageClass: "ssd"
+  # let the Zalando Postgres Operator to manage the database
+  preparedDatabases:
+    production:
+      defaultUsers: true
+      extensions:
+        pg_partman: public
+  additionalVolumes:
+    - name: pg-zalando-promtail-config
+      targetContainers:
+        - promtail
+      mountPath: /etc/promtail/config.yml
+      subPath: config.yml
+      volumeSource:
+        configMap:
+          name: pg-zalando-promtail-config
+          items:
+            - key: promtail-config.yaml
+              path: config.yml
+    - name: postgresql-monitoring-queries
+      targetContainers:
+        - exporter
+      mountPath: /etc/exporter/queries.yaml
+      subPath: queries.yaml
+      volumeSource:
+        configMap:
+          name: postgres-monitoring-queries
+          items:
+            - key: queries.yaml
+              path: queries.yaml
+  sidecars:
+    - name: promtail
+      # use promtail to collect the logs from the database
+      image: promtail:2.9.9
+    - name: "exporter"
+      image: "quay.io/prometheuscommunity/postgres-exporter:latest"
+      ports:
+        - name: exporter
+          containerPort: 9187
+          protocol: TCP
+      resources:
+        limits:
+          cpu: 100m
+          memory: 256M
+        requests:
+          cpu: 50m
+          memory: 200M
+      env:
+      - name: "DATA_SOURCE_URI"
+        value: "$(POD_NAME)/promotion?sslmode=require"
+      - name: "DATA_SOURCE_USER"
+        value: "$(POSTGRES_USER)"
+      - name: "DATA_SOURCE_PASS"
+        value: "$(POSTGRES_PASSWORD)"
+      - name: "PG_EXPORTER_AUTO_DISCOVER_DATABASES"
+        value: "false"
+      - name: PG_EXPORTER_EXCLUDE_DATABASES
+        value: "template0,template1,postgres"
+      - name: PG_EXPORTER_EXTEND_QUERY_PATH
+        value: /etc/exporter/queries.yaml
+      - name: PGAPPNAME
+        value: metrics
+
+  allowedSourceRanges:
+    # IP ranges to access your cluster go here
+  resources:
+    requests:
+      cpu: 500m
+      memory: 4Gi
+    limits:
+      cpu: 2500m
+      memory: 8Gi
+  enableLogicalBackup: true
+  logicalBackupSchedule: "30 10 * * *"
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: project.io/node-pool
+              operator: In
+              values:
+                - db
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pg-zalando-promtail-config
+  namespace: production-db
+data:
+  promtail-config.yaml: |
+    server:
+      http_listen_port: 9080
+      grpc_listen_port: 0
+
+    positions:
+      filename: /home/postgres/pgdata/tmp/promtail-positions.yaml
+
+    clients:
+      - url: http://loki.logs.svc:3100/loki/api/v1/push
+
+    scrape_configs:
+    - job_name: system
+      pipeline_stages:
+      - multiline:
+          firstline: '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC'  # A regex to detect the start of a new log entry
+          max_wait_time: 3s
+      static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: postgres
+          __path__: /home/postgres/pgdata/pgroot/pg_log/*.log
+          namespace: production-db
+          container: postgres
+          source: main
+          cluster: pg-promotion
+          pod: ${POD_NAME}
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-monitoring-queries
+  namespace: production-db
+data:
+  queries.yaml: |
+    pg_stat_statements:
+      query: "SELECT pg_get_userbyid(userid) as user, pg_database.datname, pg_stat_statements.queryid, pg_stat_statements.query,
+               pg_stat_statements.calls, pg_stat_statements.total_exec_time as time_milliseconds, pg_stat_statements.rows,
+               pg_stat_statements.shared_blks_hit, pg_stat_statements.shared_blks_read, pg_stat_statements.shared_blks_dirtied,
+               pg_stat_statements.shared_blks_written, pg_stat_statements.local_blks_hit, pg_stat_statements.local_blks_read,
+               pg_stat_statements.local_blks_dirtied, pg_stat_statements.local_blks_written, pg_stat_statements.temp_blks_read,
+               pg_stat_statements.temp_blks_written, pg_stat_statements.blk_read_time, pg_stat_statements.blk_write_time
+               FROM pg_stat_statements JOIN pg_database ON pg_database.oid = pg_stat_statements.dbid
+               WHERE pg_stat_statements.query not like '%pg_stat_statements%' and pg_database.datname != 'postgres'
+               and pg_stat_statements.query not like 'SET %' and pg_stat_statements.query != 'COMMIT' and pg_stat_statements.query != 'BEGIN'
+               and pg_stat_statements.query not like '%SAVEPOINT%'
+               ORDER BY pg_stat_statements.total_exec_time DESC LIMIT 100"
+      metrics:
+        - user:
+            usage: "LABEL"
+            description: "The user who executed the statement"
+        - datname:
+            usage: "LABEL"
+            description: "The database in which the statement was executed"
+        - queryid:
+            usage: "LABEL"
+            description: "Internal hash code, computed from the statement's parse tree"
+        - query:
+            usage: "LABEL"
+            description: "Processed query"
+        - calls:
+            usage: "COUNTER"
+            description: "Number of times executed"
+        - time_milliseconds:
+            usage: "COUNTER"
+            description: "Total time spent in the statement, in milliseconds"
+        - rows:
+            usage: "COUNTER"
+            description: "Total number of rows retrieved or affected by the statement"
+        - shared_blks_hit:
+            usage: "COUNTER"
+            description: "Total number of shared block cache hits by the statement"
+        - shared_blks_read:
+            usage: "COUNTER"
+            description: "Total number of shared blocks read by the statement"
+        - shared_blks_dirtied:
+            usage: "COUNTER"
+            description: "Total number of shared blocks dirtied by the statement"
+        - shared_blks_written:
+            usage: "COUNTER"
+            description: "Total number of shared blocks written by the statement"
+        - local_blks_hit:
+            usage: "COUNTER"
+            description: "Total number of local block cache hits by the statement"
+    pg_replication:
+      query: "SELECT CASE WHEN NOT pg_is_in_recovery() THEN 0 ELSE GREATEST (0, EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp()))) END AS lag"
+      master: true
+      metrics:
+        - lag:
+            usage: "GAUGE"
+            description: "Replication lag behind master in seconds"
+    pg_postmaster:
+      query: "SELECT pg_postmaster_start_time as start_time_seconds from pg_postmaster_start_time()"
+      master: true
+      metrics:
+        - start_time_seconds:
+            usage: "GAUGE"
+            description: "Time at which postmaster started"
+    pg_stat_slow_queries:
+      query: SELECT pg_get_userbyid(userid) as rolname,t3.datname,queryid,calls,max_exec_time / 1000 as max_time_seconds,REGEXP_REPLACE(substring(query,1,100),'["\n\s]','','g') as sql FROM pg_stat_statements t1 JOIN pg_database t3 ON (t1.dbid=t3.oid) WHERE datname != 'postgres' AND rows != 0 AND max_exec_time > 1000 ORDER BY max_exec_time DESC LIMIT 10
+      metrics:
+        - rolname:
+            usage: "LABEL"
+            description: "Name of user"
+        - datname:
+            usage: "LABEL"
+            description: "Name of database"
+        - queryid:
+            usage: "LABEL"
+            description: "Query ID"
+        - sql:
+            usage: "LABEL"
+            description: "SQL"
+        - calls:
+            usage: "COUNTER"
+            description: "Number of times executed"
+        - max_time_seconds:
+            usage: "GAUGE"
+            description: "Maximum time spent in the statement, in milliseconds"
+    pg_stat_activity_idle:
+      query: |
+        WITH
+          metrics AS (
+            SELECT
+              application_name,
+              SUM(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - state_change))::bigint)::float AS process_seconds_sum,
+              COUNT(*) AS process_seconds_count
+            FROM pg_stat_activity
+            WHERE state = 'idle'
+            GROUP BY application_name
+          ),
+          buckets AS (
+            SELECT
+              application_name,
+              le,
+              SUM(
+                CASE WHEN EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - state_change)) <= le
+                  THEN 1
+                  ELSE 0
+                END
+              )::bigint AS bucket
+            FROM
+              pg_stat_activity,
+              UNNEST(ARRAY[1, 2, 5, 15, 30, 60, 90, 120, 300]) AS le
+            GROUP BY application_name, le
+            ORDER BY application_name, le
+          )
+        SELECT
+          application_name,
+          process_seconds_sum,
+          process_seconds_count,
+          ARRAY_AGG(le) AS process_seconds,
+          ARRAY_AGG(bucket) AS process_seconds_bucket
+        FROM metrics JOIN buckets USING (application_name)
+        GROUP BY 1, 2, 3
+      metrics:
+        - application_name:
+            usage: "LABEL"
+            description: "Application Name"
+        - process_seconds:
+            usage: "HISTOGRAM"
+            description: "Idle time of server processes"
