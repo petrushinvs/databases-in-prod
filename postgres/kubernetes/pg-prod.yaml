@@ -30,18 +30,21 @@ spec:
       # after this timeout all queries on replica will be canceled until the standby will be up to date
       max_standby_archive_delay: "900s"
       max_standby_streaming_delay: "900s"
-
       wal_level: "replica"
-      max_wal_senders: "6"
-      max_replication_slots: "6"
+      max_wal_senders: "4"
+      max_replication_slots: "4"
       max_worker_processes: "16"
-      max_parallel_workers: "4"
-      max_parallel_workers_per_gather: "4"
+      max_parallel_workers: "8"
+      max_parallel_workers_per_gather: "2"
       max_parallel_maintenance_workers: "2"
+
       max_wal_size: "4GB"
       min_wal_size: "2GB"
       wal_keep_size: "2GB"
       effective_cache_size: "4GB"
+      shared_buffers: "2GB"
+      work_mem: "64MB"
+      maintenance_work_mem: "256MB"
       # we're on ssd
       effective_io_concurrency: "100"
       random_page_cost: "1.1"
@@ -51,11 +54,8 @@ spec:
       pg_stat_statements.max: "1000"
       pg_stat_statements.track: "all"
       cron.database_name: "postgres"
-
       synchronous_commit: "local"
-      shared_buffers: "2GB"
-      work_mem: "64MB"
-      maintenance_work_mem: "256MB"
+
 
   numberOfInstances: 2
   enableShmVolume: true
@@ -82,7 +82,7 @@ spec:
     # max client connections per pooler is always 10 000!!!
 
   volume:
-    size: "60Gi"
+    size: "150Gi"
     storageClass: "ssd"
   # let the Zalando Postgres Operator to manage the database
   preparedDatabases:
@@ -211,7 +211,7 @@ metadata:
 data:
   queries.yaml: |
     pg_stat_statements:
-      query: "SELECT pg_get_userbyid(userid) as user, pg_database.datname, pg_stat_statements.queryid, pg_stat_statements.query,
+      query: "SELECT pg_get_userbyid(userid) as user, pg_database.datname, pg_stat_statements.queryid, SUBSTRING(pg_stat_statements.query,1,2000) as query,
                pg_stat_statements.calls, pg_stat_statements.total_exec_time as time_milliseconds, pg_stat_statements.rows,
                pg_stat_statements.shared_blks_hit, pg_stat_statements.shared_blks_read, pg_stat_statements.shared_blks_dirtied,
                pg_stat_statements.shared_blks_written, pg_stat_statements.local_blks_hit, pg_stat_statements.local_blks_read,
@@ -294,46 +294,3 @@ data:
         - max_time_seconds:
             usage: "GAUGE"
             description: "Maximum time spent in the statement, in milliseconds"
-    pg_stat_activity_idle:
-      query: |
-        WITH
-          metrics AS (
-            SELECT
-              application_name,
-              SUM(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - state_change))::bigint)::float AS process_seconds_sum,
-              COUNT(*) AS process_seconds_count
-            FROM pg_stat_activity
-            WHERE state = 'idle'
-            GROUP BY application_name
-          ),
-          buckets AS (
-            SELECT
-              application_name,
-              le,
-              SUM(
-                CASE WHEN EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - state_change)) <= le
-                  THEN 1
-                  ELSE 0
-                END
-              )::bigint AS bucket
-            FROM
-              pg_stat_activity,
-              UNNEST(ARRAY[1, 2, 5, 15, 30, 60, 90, 120, 300]) AS le
-            GROUP BY application_name, le
-            ORDER BY application_name, le
-          )
-        SELECT
-          application_name,
-          process_seconds_sum,
-          process_seconds_count,
-          ARRAY_AGG(le) AS process_seconds,
-          ARRAY_AGG(bucket) AS process_seconds_bucket
-        FROM metrics JOIN buckets USING (application_name)
-        GROUP BY 1, 2, 3
-      metrics:
-        - application_name:
-            usage: "LABEL"
-            description: "Application Name"
-        - process_seconds:
-            usage: "HISTOGRAM"
-            description: "Idle time of server processes"
