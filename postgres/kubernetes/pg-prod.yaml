@@ -273,24 +273,3 @@ data:
         - start_time_seconds:
             usage: "GAUGE"
             description: "Time at which postmaster started"
-    pg_stat_slow_queries:
-      query: SELECT pg_get_userbyid(userid) as rolname,t3.datname,queryid,calls,max_exec_time / 1000 as max_time_seconds,REGEXP_REPLACE(substring(query,1,100),'["\n\s]','','g') as sql FROM pg_stat_statements t1 JOIN pg_database t3 ON (t1.dbid=t3.oid) WHERE datname != 'postgres' AND rows != 0 AND max_exec_time > 1000 ORDER BY max_exec_time DESC LIMIT 10
-      metrics:
-        - rolname:
-            usage: "LABEL"
-            description: "Name of user"
-        - datname:
-            usage: "LABEL"
-            description: "Name of database"
-        - queryid:
-            usage: "LABEL"
-            description: "Query ID"
-        - sql:
-            usage: "LABEL"
-            description: "SQL"
-        - calls:
-            usage: "COUNTER"
-            description: "Number of times executed"
-        - max_time_seconds:
-            usage: "GAUGE"
-            description: "Maximum time spent in the statement, in milliseconds"
