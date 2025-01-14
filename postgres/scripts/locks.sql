@@ -22,3 +22,8 @@ WHERE
     AND pg_stat_activity.query NOT ILIKE '%pg_stat_activity%'  -- Exclude this query itself
 ORDER BY 
     pg_stat_activity.query_start;
+
+-- blocked queries
+select pid, usename, pg_blocking_pids(pid) as blocked_by, query as blocked_query
+from pg_stat_activity
+where cardinality(pg_blocking_pids(pid)) > 0;
